@@ -26,15 +26,35 @@ jobs:
             exit 1
           fi
 
-          STATE=$(flyctl machines list -a "$APP" -j | jq -r --arg id "$MACHINE_ID" '.[] | select(.id==$id) | .state')
-          echo "Using machine $MACHINE_ID (state=$STATE)"
+          MACHINE_JSON=$(flyctl machines list -a "$APP" -j | jq -c --arg id "$MACHINE_ID" '.[] | select(.id==$id)')
+          STATE=$(echo "$MACHINE_JSON" | jq -r '.state')
+          UPDATED_AT=$(echo "$MACHINE_JSON" | jq -r '.updated_at // empty')
+          echo "Using machine $MACHINE_ID (state=$STATE updated_at=$UPDATED_AT)"
 
           # A Fly volume can only attach to one machine. Reuse that machine
           # instead of creating a new one with `fly machine run --volume`.
-          # Do NOT restart an already-running machine — that interrupts QR
-          # linking and can corrupt the LocalAuth session on /data.
+          #
+          # If a previous run is still started after ~12 minutes (QR wait / hung
+          # WhatsApp init), stop it so the schedule can recover instead of
+          # failing every cycle for hours.
           if [ "$STATE" = "started" ] || [ "$STATE" = "starting" ]; then
-            echo "Machine already running; waiting for it to finish."
+            AGE_SEC=0
+            if [ -n "$UPDATED_AT" ]; then
+              UPDATED_EPOCH=$(date -u -d "$UPDATED_AT" +%s 2>/dev/null || date -u -j -f "%Y-%m-%dT%H:%M:%SZ" "$UPDATED_AT" +%s 2>/dev/null || echo 0)
+              NOW_EPOCH=$(date -u +%s)
+              if [ "$UPDATED_EPOCH" -gt 0 ]; then
+                AGE_SEC=$((NOW_EPOCH - UPDATED_EPOCH))
+              fi
+            fi
+            echo "Machine already running (age=${AGE_SEC}s)"
+            if [ "$AGE_SEC" -gt 720 ]; then
+              echo "Previous run looks stuck; stopping machine before restart."
+              flyctl machine stop "$MACHINE_ID" -a "$APP" || true
+              flyctl machine wait "$MACHINE_ID" -a "$APP" --state stopped -w 2m || true
+              flyctl machine start "$MACHINE_ID" -a "$APP"
+            else
+              echo "Waiting for in-progress run to finish."
+            fi
           else
             flyctl machine start "$MACHINE_ID" -a "$APP"
           fi

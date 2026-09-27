@@ -1,3 +1,4 @@
+const { execFileSync } = require('child_process');
 const { Client, LocalAuth } = require('whatsapp-web.js');
 const qrcode = require('qrcode-terminal');
 
@@ -22,6 +23,26 @@ const READY_FALLBACK_MS = Number(process.env.WHATSAPP_READY_FALLBACK_MS || 18000
 const WEB_VERSION = process.env.WHATSAPP_WEB_VERSION || null;
 const WEB_VERSION_CACHE_PATH =
   process.env.WHATSAPP_WEB_VERSION_CACHE_PATH || '/app/wa-version-cache';
+// Linked account's number in international format, digits only (e.g. 61412345678).
+// When set, linking uses an 8-character pairing code instead of a QR scan.
+const PAIRING_PHONE = (process.env.WHATSAPP_PAIRING_PHONE || '').replace(/\D/g, '');
+
+// whatsapp-web.js defaults to a Chrome 101 user agent, which WhatsApp can
+// reject during device linking. Advertise the real Chromium major version.
+function getUserAgent() {
+  if (process.env.WHATSAPP_USER_AGENT) return process.env.WHATSAPP_USER_AGENT;
+  const executable = process.env.PUPPETEER_EXECUTABLE_PATH;
+  if (!executable) return undefined;
+  try {
+    const output = execFileSync(executable, ['--version'], { encoding: 'utf8' });
+    const major = output.match(/(\d+)\.\d+\.\d+\.\d+/)?.[1];
+    if (!major) return undefined;
+    return `Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${major}.0.0.0 Safari/537.36`;
+  } catch (err) {
+    console.warn('Could not detect Chromium version for user agent:', err.message);
+    return undefined;
+  }
+}
 
 function getPuppeteerOptions() {
   const args = [
@@ -167,6 +188,19 @@ async function createAndInitializeClient() {
         path: WEB_VERSION_CACHE_PATH,
       };
     }
+    const userAgent = getUserAgent();
+    if (userAgent) {
+      clientOptions.userAgent = userAgent;
+      console.log(`Using browser user agent: ${userAgent}`);
+    }
+    if (PAIRING_PHONE) {
+      clientOptions.pairWithPhoneNumber = {
+        phoneNumber: PAIRING_PHONE,
+        showNotification: true,
+        intervalMs: 180000,
+      };
+      console.log(`Device linking via pairing code for number ending ${PAIRING_PHONE.slice(-3)}`);
+    }
     const client = new Client(clientOptions);
 
     let settled = false;
@@ -184,7 +218,11 @@ async function createAndInitializeClient() {
       fn(value);
     };
 
+    let initStarted = false;
     const completeInit = async (label) => {
+      if (initStarted || settled) return;
+      initStarted = true;
+      if (readyFallbackTimer) clearTimeout(readyFallbackTimer);
       console.log(`WhatsApp init complete (${label})`);
       try {
         await waitForChatSync();
@@ -267,6 +305,15 @@ async function createAndInitializeClient() {
       armTimeout(QR_WAIT_MS, 'waiting for QR scan');
     });
 
+    client.on('code', (code) => {
+      const formatted = String(code).replace(/^(.{4})(.{4})$/, '$1-$2');
+      console.log(`WhatsApp pairing code: ${formatted}`);
+      console.log(
+        'On your phone: WhatsApp > Settings > Linked devices > Link a device > "Link with phone number instead", then enter the code.'
+      );
+      armTimeout(QR_WAIT_MS, 'waiting for pairing code entry');
+    });
+
     client.on('loading_screen', (percent, message) => {
       loadingPercent = Number(percent) || 0;
       // WhatsApp often stalls at 99% and never emits 100.
@@ -292,6 +339,15 @@ async function createAndInitializeClient() {
     });
 
     client.on('disconnected', (reason) => {
+      // Before auth, whatsapp-web.js recovers from LOGOUT by clearing the
+      // session and re-injecting, which produces a fresh QR / pairing code.
+      if (reason === 'LOGOUT' && !isAuthenticated) {
+        console.warn(
+          'WhatsApp logged out before linking finished (link rejected or expired). Waiting for a fresh QR / pairing code...'
+        );
+        armTimeout(QR_WAIT_MS, 'waiting for new link after LOGOUT');
+        return;
+      }
       finish(reject, new Error(`WhatsApp disconnected during init: ${reason}`));
     });
 
@@ -331,7 +387,39 @@ async function waitForServerAck(client, sentMessage, timeoutMs = 45000) {
   });
 }
 
+// WhatsApp Web sometimes reloads itself (commonly a few minutes after a new
+// device link). The library re-injects its helpers after the reload; calls
+// made in between fail with "window.require is not a function" or
+// "Cannot read properties of undefined". Wait for the page to be usable.
+async function waitForPageInjected(client, timeoutMs = 180000) {
+  const deadline = Date.now() + timeoutMs;
+  let warned = false;
+  while (Date.now() < deadline) {
+    try {
+      const ready = await client.pupPage.evaluate(
+        () =>
+          typeof window.require === 'function' &&
+          typeof window.WWebJS !== 'undefined' &&
+          !!window.require('WAWebCollections')?.Chat
+      );
+      if (ready) {
+        if (warned) console.log('WhatsApp page is usable again after reload.');
+        return;
+      }
+    } catch (_) {
+      // Execution context destroyed mid-navigation; retry.
+    }
+    if (!warned) {
+      console.warn('WhatsApp page reloaded; waiting for it to finish loading...');
+      warned = true;
+    }
+    await new Promise((r) => setTimeout(r, 5000));
+  }
+  throw new Error('WhatsApp page did not finish reloading in time');
+}
+
 async function sendMessage(client, message) {
+  await waitForPageInjected(client);
   if (!resolvedGroupId) {
     await resolveTargetGroup(client);
   }
@@ -352,6 +440,7 @@ async function sendMessage(client, message) {
     } catch (err) {
       console.warn(`getChatById attempt ${attempt}/5 failed: ${err.message}`);
       await new Promise((r) => setTimeout(r, 3000));
+      await waitForPageInjected(client);
     }
   }
   if (!chatLoaded) {
