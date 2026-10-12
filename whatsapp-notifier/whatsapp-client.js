@@ -26,6 +26,14 @@ const WEB_VERSION_CACHE_PATH =
 // Linked account's number in international format, digits only (e.g. 61412345678).
 // When set, linking uses an 8-character pairing code instead of a QR scan.
 const PAIRING_PHONE = (process.env.WHATSAPP_PAIRING_PHONE || '').replace(/\D/g, '');
+// Linking is only attempted before this ISO timestamp. Scheduled runs without
+// a valid session otherwise send a "link a new device" prompt to the phone
+// every cycle, with nobody there to enter the code.
+const LINK_UNTIL = Date.parse(process.env.WHATSAPP_LINK_UNTIL || '');
+
+function isLinkingAllowed() {
+  return Number.isFinite(LINK_UNTIL) && Date.now() < LINK_UNTIL;
+}
 
 // whatsapp-web.js defaults to a Chrome 101 user agent, which WhatsApp can
 // reject during device linking. Advertise the real Chromium major version.
@@ -193,7 +201,8 @@ async function createAndInitializeClient() {
       clientOptions.userAgent = userAgent;
       console.log(`Using browser user agent: ${userAgent}`);
     }
-    if (PAIRING_PHONE) {
+    const linkingAllowed = isLinkingAllowed();
+    if (PAIRING_PHONE && linkingAllowed) {
       clientOptions.pairWithPhoneNumber = {
         phoneNumber: PAIRING_PHONE,
         showNotification: true,
@@ -298,6 +307,15 @@ async function createAndInitializeClient() {
     });
 
     client.on('qr', (qr) => {
+      if (!linkingAllowed) {
+        finish(
+          reject,
+          new Error(
+            'WhatsApp is not linked (session missing or logged out). Relink by setting WHATSAPP_LINK_UNTIL on the machine and starting it.'
+          )
+        );
+        return;
+      }
       console.log('QR Code received, scan with your phone:');
       console.log(`Waiting up to ${Math.round(QR_WAIT_MS / 1000)}s for you to scan before this run exits.`);
       qrcode.generate(qr, { small: true });

@@ -26,6 +26,24 @@ jobs:
             exit 1
           fi
 
+          machine_state() {
+            flyctl machines list -a "$APP" -j | jq -r --arg id "$MACHINE_ID" '.[] | select(.id==$id) | .state'
+          }
+
+          # `flyctl machine wait -w 25m` gives up after ~1 minute on recent
+          # flyctl versions (deadline_exceeded), so poll the state instead.
+          wait_for_stopped() {
+            local deadline=$(( $(date +%s) + $1 ))
+            while [ "$(date +%s)" -lt "$deadline" ]; do
+              if [ "$(machine_state)" = "stopped" ]; then
+                return 0
+              fi
+              sleep 15
+            done
+            echo "Machine did not stop within $1 seconds."
+            return 1
+          }
+
           MACHINE_JSON=$(flyctl machines list -a "$APP" -j | jq -c --arg id "$MACHINE_ID" '.[] | select(.id==$id)')
           STATE=$(echo "$MACHINE_JSON" | jq -r '.state')
           UPDATED_AT=$(echo "$MACHINE_JSON" | jq -r '.updated_at // empty')
@@ -50,7 +68,7 @@ jobs:
             if [ "$AGE_SEC" -gt 720 ]; then
               echo "Previous run looks stuck; stopping machine before restart."
               flyctl machine stop "$MACHINE_ID" -a "$APP" || true
-              flyctl machine wait "$MACHINE_ID" -a "$APP" --state stopped -w 2m || true
+              wait_for_stopped 120 || true
               flyctl machine start "$MACHINE_ID" -a "$APP"
             else
               echo "Waiting for in-progress run to finish."
@@ -62,7 +80,8 @@ jobs:
           # Wait for the batch job to finish. Previously we only checked that
           # the machine started, which hid processor failures (e.g. bad DB URL).
           echo "Waiting for machine to stop..."
-          flyctl machine wait "$MACHINE_ID" -a "$APP" --state stopped -w 25m
+          sleep 10
+          wait_for_stopped 1500
 
           # Fly often omits exit_code on clean short-lived exits (events only
           # include signal/exited_at). Prefer exit_code when present; otherwise
